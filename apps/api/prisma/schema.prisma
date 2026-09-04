@@ -1,0 +1,269 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum SourceType {
+  PAYMENT
+  SUBSCRIPTION
+  INVOICE
+}
+
+enum CasePriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum CaseStatus {
+  DETECTED
+  INVESTIGATING
+  DECIDED
+  POLICY_APPROVED
+  POLICY_REJECTED
+  ACTION_SCHEDULED
+  ACTION_IN_PROGRESS
+  RECOVERED
+  FAILED
+  ESCALATED
+}
+
+enum RecoveryActionType {
+  RETRY_PAYMENT
+  SEND_REMINDER
+  WAIT
+  ESCALATE_HUMAN
+}
+
+// Lifecycle for recovery_actions, claimed atomically by the scheduler (see CHANGE 3).
+enum ActionStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum AuditActor {
+  RECOVERABILITY_ENGINE
+  INVESTIGATOR_AGENT
+  DECISION_AGENT
+  POLICY_ENGINE
+  ACTION_ENGINE
+  VERIFIER
+  SCHEDULER
+  // A human operator acting directly from the dashboard (escalate/retry-now),
+  // not an AI proposal — kept distinct in the audit trail on purpose so it's
+  // never conflated with an automated decision.
+  OPERATOR
+}
+
+// ---------------------------------------------------------------------------
+// Core domain
+// ---------------------------------------------------------------------------
+
+model Customer {
+  id                 String   @id @default(cuid())
+  providerCustomerId String?  @unique
+  name               String
+  email              String
+  phone              String?
+  createdAt          DateTime @default(now())
+
+  payments      Payment[]
+  subscriptions Subscription[]
+  invoices      Invoice[]
+  recoveryCases RecoveryCase[]
+
+  @@map("customers")
+}
+
+model Payment {
+  id                String   @id @default(cuid())
+  providerPaymentId String   @unique
+  customerId        String
+  customer          Customer @relation(fields: [customerId], references: [id])
+  amount            Decimal  @db.Decimal(12, 2)
+  currency          String   @default("INR")
+  status            String
+  method            String
+  failureReason     String?
+  createdAt         DateTime @default(now())
+
+  events PaymentEvent[]
+
+  @@map("payments")
+}
+
+// Raw inbound webhook events. This is the idempotency boundary (CHANGE 2):
+// providerEventId is the same-request-twice deduplication key.
+model PaymentEvent {
+  id              String   @id @default(cuid())
+  providerEventId String   @unique
+  eventType       String
+  paymentId       String
+  payment         Payment  @relation(fields: [paymentId], references: [id])
+  rawPayload      Json
+  receivedAt      DateTime @default(now())
+
+  recoveryCase RecoveryCase?
+
+  @@map("payment_events")
+}
+
+model Subscription {
+  id             String   @id @default(cuid())
+  customerId     String
+  customer       Customer @relation(fields: [customerId], references: [id])
+  amount         Decimal  @db.Decimal(12, 2)
+  currency       String   @default("INR")
+  status         String
+  nextPaymentAt  DateTime
+  failedAttempts Int      @default(0)
+  createdAt      DateTime @default(now())
+
+  @@map("subscriptions")
+}
+
+model Invoice {
+  id         String   @id @default(cuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+  amount     Decimal  @db.Decimal(12, 2)
+  currency   String   @default("INR")
+  dueDate    DateTime
+  status     String
+  createdAt  DateTime @default(now())
+
+  @@map("invoices")
+}
+
+// ---------------------------------------------------------------------------
+// Recovery pipeline
+// ---------------------------------------------------------------------------
+
+model RecoveryCase {
+  id       String     @id @default(cuid())
+  source   SourceType
+  // Polymorphic pointer to payments/subscriptions/invoices.id — kept as a plain
+  // string (not a typed FK) because the source table varies by `source`.
+  sourceId String
+
+  paymentEventId String?       @unique
+  paymentEvent   PaymentEvent? @relation(fields: [paymentEventId], references: [id])
+
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+
+  amountAtRisk        Decimal      @db.Decimal(12, 2)
+  currency            String       @default("INR")
+  riskScore           Float
+  recoverabilityScore Float
+  priority            CasePriority
+
+  reason            String?
+  recommendedAction RecoveryActionType?
+  // investigatorAgent's own diagnosed cause (e.g. "temporary_payment_failure"),
+  // kept as a real column rather than only inside an audit-log JSON payload so
+  // learningInsights.ts can aggregate success rate by cause without a JSON
+  // query. Null for cases that predate this column or never reached investigation.
+  investigatedCause String?
+
+  status    CaseStatus @default(DETECTED)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  actions   RecoveryAction[]
+  outcomes  RecoveryOutcome[]
+  auditLogs RecoveryAuditLog[]
+  openSlot  OpenRecoverySlot?
+
+  @@index([status])
+  @@index([priority])
+  @@map("recovery_cases")
+}
+
+// Subscriptions/invoices have no webhook (and thus no payment_events-style
+// unique key) to key idempotency off of — they're found by scanning the
+// table (detectionScanner.ts). This is the equivalent DB-level guarantee for
+// that path: created atomically alongside the case, so two processes racing
+// to detect the same due subscription/invoice can't both win (the loser hits
+// this unique constraint, not an app-level check-then-insert race). Deleted
+// once the case resolves, freeing the source for its next failure cycle.
+model OpenRecoverySlot {
+  id       String       @id @default(cuid())
+  source   SourceType
+  sourceId String
+  caseId   String       @unique
+  case     RecoveryCase @relation(fields: [caseId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@unique([source, sourceId])
+  @@map("open_recovery_slots")
+}
+
+model RecoveryAction {
+  id     String       @id @default(cuid())
+  caseId String
+  case   RecoveryCase @relation(fields: [caseId], references: [id])
+
+  actionType    RecoveryActionType
+  reason        String
+  attemptNumber Int                @default(1)
+
+  status       ActionStatus @default(PENDING)
+  scheduledFor DateTime
+  claimedAt    DateTime?
+  executedAt   DateTime?
+  result       Json?
+
+  createdAt DateTime @default(now())
+
+  outcomes RecoveryOutcome[]
+
+  // The scheduler's atomic claim query filters on (status, scheduledFor);
+  // this index keeps that poll cheap as the table grows.
+  @@index([status, scheduledFor])
+  @@map("recovery_actions")
+}
+
+model RecoveryOutcome {
+  id     String       @id @default(cuid())
+  caseId String
+  case   RecoveryCase @relation(fields: [caseId], references: [id])
+
+  actionId String?
+  action   RecoveryAction? @relation(fields: [actionId], references: [id])
+
+  amountRecovered Decimal  @db.Decimal(12, 2)
+  success         Boolean
+  recoveredAt     DateTime @default(now())
+
+  @@map("recovery_outcomes")
+}
+
+// Append-only trail of every deterministic + AI decision, satisfying
+// "every action must be logged" and backing the AI Activity / Audit page.
+model RecoveryAuditLog {
+  id     String       @id @default(cuid())
+  caseId String
+  case   RecoveryCase @relation(fields: [caseId], references: [id])
+
+  actor   AuditActor
+  summary String
+  payload Json
+
+  createdAt DateTime @default(now())
+
+  @@index([caseId])
+  @@map("recovery_audit_logs")
+}

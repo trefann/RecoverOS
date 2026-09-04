@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: recoveros
+      POSTGRES_PASSWORD: recoveros
+      POSTGRES_DB: recoveros
+    ports:
+      - "5432:5432"
+    volumes:
+      - recoveros_pgdata:/var/lib/postgresql/data
+
+volumes:
+  recoveros_pgdata:

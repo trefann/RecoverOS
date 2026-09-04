@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Overrides base's ESNext/Bundler resolution: this package is imported
+    // by apps/api's compiled output at real Node runtime (plain `node
+    // dist/index.js`, no transpiler), which requires NodeNext module
+    // resolution and actual .js files on disk — not the raw .ts source dev
+    // mode gets away with via tsx/webpack transpilation.
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "declaration": true,
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
+}
