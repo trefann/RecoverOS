@@ -1,5 +1,10 @@
 import type { z } from "zod";
-import type Groq from "groq-sdk";
+// Imported from their declaring module directly, not via Groq.Chat.Completions.X
+// namespace-merging sugar — that path is convenient but not a stable contract
+// across groq-sdk versions (it silently broke between versions we tested
+// locally vs. what a clean install resolved elsewhere), while these two
+// types are genuinely exported symbols of this file in every version.
+import type { ChatCompletionTool, ChatCompletionMessageParam } from "groq-sdk/resources/chat/completions.js";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { getGroqClient, DEFAULT_MODEL } from "./client.js";
 
@@ -27,7 +32,7 @@ export async function callStructured<T extends z.ZodTypeAny>(
   const jsonSchema = zodToJsonSchema(params.schema, "output");
   const parameters = (jsonSchema.definitions?.output ?? jsonSchema) as Record<string, unknown>;
 
-  const tool: Groq.Chat.Completions.ChatCompletionTool = {
+  const tool: ChatCompletionTool = {
     type: "function",
     function: {
       name: params.toolName,
@@ -36,7 +41,7 @@ export async function callStructured<T extends z.ZodTypeAny>(
     },
   };
 
-  const messages: Groq.Chat.Completions.ChatCompletionMessageParam[] = [
+  const messages: ChatCompletionMessageParam[] = [
     { role: "system", content: params.system },
     { role: "user", content: params.prompt },
   ];
