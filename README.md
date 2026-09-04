@@ -183,6 +183,42 @@ npm run test --workspaces --if-present
   make sure no other `dev:api` instance is running against the same database at the same time — they share
   the scheduler's detection scan, so a live instance racing the test suite can produce confusing failures.
 
+## Deploying (split hosting: Vercel + Railway)
+
+`apps/web` (Next.js) deploys to Vercel; `apps/api` (Express + a `setInterval`-based scheduler) needs a host
+that keeps a persistent Node process running, which rules out Vercel's serverless functions — Railway works
+well and needs no code changes.
+
+**`packages/shared` must be built before `apps/api` can run in production.** In dev, `tsx`/webpack transpile
+its TypeScript on the fly; a real `node dist/index.js` cannot import `.ts` directly. `npm install` at the
+repo root now builds it automatically (`postinstall` in `packages/shared/package.json`) — this isn't
+optional config, skipping it means the API crashes on boot with `ERR_MODULE_NOT_FOUND`.
+
+**Railway (apps/api):**
+1. New Project → Deploy from GitHub repo → this repo.
+2. Root Directory: leave as the **repo root** (not `apps/api`) — the build needs `npm install` to run where
+   the workspaces are defined, so it can resolve `@recoveros/shared`.
+3. Build Command: `npm run build:api`
+4. Start Command: `npm run start:api`
+5. Env vars: `DATABASE_URL`, `GROQ_API_KEY`, `GROQ_MODEL` (`openai/gpt-oss-120b`), `WEB_ORIGIN` (fill in
+   after step 2 of Vercel below). `PORT` is injected by Railway automatically — the app already prefers it
+   over `API_PORT`.
+6. Reusing the same Neon `DATABASE_URL` from local dev is the simplest option — it's already migrated and
+   seeded, so there's no separate migration step. A dedicated prod database needs one:
+   `DATABASE_URL=<prod-url> npm run db:deploy --workspace apps/api` (uses `prisma migrate deploy`, not
+   `migrate dev`).
+
+**Vercel (apps/web):**
+1. Import Git Repository → this repo.
+2. Root Directory: `apps/web` (set explicitly in the import wizard — Vercel's monorepo detection should
+   handle installing from the workspace root automatically, but if the build fails on resolving
+   `@recoveros/shared`, override Install Command to `cd ../.. && npm install`).
+3. Env var: `NEXT_PUBLIC_API_BASE_URL` = the Railway service's public URL from the step above.
+4. Deploy.
+
+**Then**, back on Railway: set `WEB_ORIGIN` to the Vercel production URL and redeploy — CORS is a single
+exact-origin allowlist (`index.ts`), so the API rejects requests from an origin it wasn't told about.
+
 ## What's deliberately not built
 
 - Real Razorpay integration (`RazorpayProvider` is a stub behind the same `PaymentProvider` interface
